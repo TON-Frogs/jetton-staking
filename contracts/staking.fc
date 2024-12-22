@@ -1,0 +1,201 @@
+
+
+;; TEP74 Jetton staking contract
+
+;; needs stdlib.fc
+
+
+(slice, slice, int, cell, slice, cell) load_data() {
+    
+    slice ds = get_data().begin_parse();
+
+    return (ds~load_msg_addr(),  ds~load_msg_addr(),  ds~load_uint(64),      ds~load_dict(),     ds~load_msg_addr(),     ds~load_ref());
+
+    ;;        Base address,        Owner address,     Next stake index,   Dictionary of stakes,    jetton master,       jetton wallet code
+
+}
+
+
+() save_data(slice base_address, slice owner_address, int next_stake_index, cell stakes, slice jetton_master, cell jetton_wallet_code) impure inline {
+
+    set_data(begin_cell()
+        .store_slice(base_address)
+        .store_slice(owner_address)
+        .store_uint(next_stake_index, 64)
+        .store_dict(stakes)
+        .store_slice(jetton_master)
+        .store_ref(jetton_wallet_code)
+    .end_cell());
+
+}
+
+
+slice jetton_wallet_address(slice owner, slice jetton_master_address, cell jetton_wallet_code) {
+
+    return begin_cell()
+        .store_uint(4, 3)
+        .store_int(0, 8)
+        .store_uint(cell_hash(begin_cell()
+            .store_uint(0, 2)
+            .store_dict(jetton_wallet_code)
+            .store_dict(begin_cell()
+                .store_coins(0)
+                .store_slice(owner)
+                .store_slice(jetton_master_address)
+                .store_ref(jetton_wallet_code)
+            .end_cell())
+            .store_uint(0, 1)
+        .end_cell()), 256)
+    .end_cell().begin_parse();
+
+}
+
+
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+
+    if (in_msg_body.slice_empty?()) {
+        return ();
+    }
+
+    slice msg = in_msg_full.begin_parse();
+
+    if (msg~load_uint(4) & 1) {
+        return ();
+    }
+
+    slice sender = msg~load_msg_addr();
+
+    msg~load_msg_addr();
+
+    int value = msg~load_coins();
+
+    msg~skip_bits(1);
+    msg~load_coins();
+    msg~load_coins();
+
+    int opcode = in_msg_body~load_uint(32);
+    int query_id = in_msg_body~load_uint(64);
+
+
+    var (base_address, owner_address, next_stake_index, stakes, jetton_master, jetton_wallet_code) = load_data();
+
+
+    if(opcode == 0x7362d09c) {
+
+        slice jetton_wallet_addr = jetton_wallet_address(my_address(), jetton_master, jetton_wallet_code);
+
+        throw_unless(400, equal_slice_bits(sender, jetton_wallet_addr)); ;; not staking jetton
+
+        int jetton_sum = in_msg_body~load_coins();
+        slice from_address = in_msg_body~load_msg_addr();
+
+        throw_unless(401, equal_slice_bits(from_address, base_address)); ;; tx wasn't sent from base pool
+
+
+        if(in_msg_body~load_uint(32) == 1) { ;; Stake
+                
+            int sum = in_msg_body~load_coins();
+            int final_sum = in_msg_body~load_coins();
+            int start = in_msg_body~load_uint(64);
+            int end = in_msg_body~load_uint(64);
+
+            throw_unless(402, jetton_sum != final_sum);
+
+            stakes~udict_set(64, next_stake_index, begin_cell()
+                .store_uint(0, 1)
+                .store_coins(sum)
+                .store_coins(final_sum)
+                .store_uint(start, 64)
+                .store_uint(end, 64)
+            .end_cell().begin_parse());
+
+
+            save_data(base_address, owner_address, next_stake_index + 1, stakes, jetton_master, jetton_wallet_code);
+
+        }
+
+        return ();
+
+    }
+
+
+    
+    if(opcode == 2) {  ;; Unstake
+        
+        throw_unless(403, equal_slice_bits(sender, owner_address)); ;; tx wasn't sent from owner
+
+        throw_unless(404, value >= 100000000); ;; Unstake amount > 0.1 TON
+
+
+        int stake_index = in_msg_body~load_uint(64);
+
+        (slice stake, int success) = stakes.udict_get?(64, stake_index);
+        
+        
+        throw_unless(405, success == -1); ;; Stake doesn't exist
+        
+        int ended = stake~load_uint(1);
+        int sum = stake~load_coins();
+        int final_sum = stake~load_coins();
+        int start = stake~load_uint(64);
+        int end = stake~load_uint(64);
+
+        throw_unless(406, ended == 0); ;; Stake is already claimed
+        
+        throw_unless(407, end < now()); ;; Stake isn't ended
+        
+
+
+        stakes~udict_set(64, stake_index, begin_cell()
+            .store_uint(1, 1)
+            .store_coins(sum)
+            .store_coins(final_sum)
+            .store_uint(start, 64)
+            .store_uint(end, 64)
+        .end_cell().begin_parse());
+
+
+        slice jetton_wallet_addr = jetton_wallet_address(my_address(), jetton_master, jetton_wallet_code);
+
+        var msg = begin_cell()
+            .store_uint(0x10, 6)
+            .store_slice(jetton_wallet_addr)
+            .store_coins(100000000)
+            .store_uint(1, 107)
+            .store_ref(begin_cell()
+                .store_uint(0xf8a7ea5, 32)
+                .store_uint(query_id, 64)
+                .store_coins(final_sum)
+                .store_slice(owner_address)
+                .store_slice(owner_address)
+                .store_uint(0, 1)
+                .store_coins(10000000)
+                .store_slice(begin_cell()
+                    .store_uint(0, 32)
+                .end_cell().begin_parse())
+            .end_cell());
+
+
+        send_raw_message(msg.end_cell(), 0);
+
+
+        save_data(base_address, owner_address, next_stake_index, stakes, jetton_master, jetton_wallet_code);
+
+        return ();
+
+    }
+
+
+}
+
+
+
+
+(slice, slice, int, cell) get_staking_data() method_id {
+
+    var (base_address, owner_address, next_stake_index, stakes, _, _) = load_data();
+
+    return (base_address, owner_address, next_stake_index, stakes);
+
+}
